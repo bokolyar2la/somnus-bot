@@ -1,0 +1,81 @@
+datasource db {
+  provider = "sqlite"
+  url      = "file:./dev.db"
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model User {
+  id        String       @id @default(cuid())
+  tgId      String       @unique
+  createdAt DateTime     @default(now())
+  entries   DreamEntry[]
+
+  // === Настройки профиля ===
+  timezone         String? // IANA, напр. "Europe/Moscow"
+  ageBand          String? // "18-24" | "25-34" | "35-44" | "45-54" | "55+"
+  chronotype       String? // "lark" | "owl" | "mixed"
+  tone             String? // "neutral" | "poetic" | "mystic" | "calm-science"
+  esotericaLevel   Int?
+  sleepGoal        String? // "fall_asleep" | "remember" | "symbols" | "less_anxiety"
+  wakeTime         String? // "HH:MM"
+  sleepTime        String? // "HH:MM"
+  stressLevel      Int?
+  dreamFrequency   String? // "rarely" | "sometimes" | "often"
+  remindMorning    String? // "HH:MM"
+  remindEvening    String? // "HH:MM"
+  remindersEnabled Boolean @default(true)
+
+  weeklyEnabled Boolean @default(true)
+  weeklyDay     Int     @default(0) // 0=Sunday, 1=Monday ...
+  weeklyHour    Int     @default(10) // 10:00 локально
+
+  lastMorningSent DateTime?
+  lastEveningSent DateTime?
+  lastWeeklySent  DateTime?
+
+  // --- Подписка ---
+  plan          String    @default("free") // 'free' | 'paid' (legacy: 'plus'|'lite'|'pro'|'premium' трактуем как 'paid' в коде)
+  planUntil     DateTime?
+  monthlyCount  Int       @default(0)
+  lastPlanReset DateTime?
+
+  // --- Onboarding ---
+  firstInterpretDone Boolean @default(false) // флаг первого разбора
+
+  // --- Report tracking ---
+  lastReportAt DateTime? // UTC timestamp of last report generation (for paid users)
+  lastReportMonth String? // YYYY-MM format for free users monthly limit
+
+  @@index([plan])
+}
+
+model DreamEntry {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  // Можем не знать точное «время сна» — делаем необязательным
+  sleptAt DateTime?
+  text    String
+
+  // Пользовательские теги через запятую
+  symbolsRaw String?
+
+  // LLM-результат храним как текст (JSON string)
+  llmJsonText String?
+  tokensIn    Int     @default(0)
+  tokensOut   Int     @default(0)
+  costRub     Float   @default(0)
+
+  // Маркеры через запятую (например: "practice_issued:2025-08,badge:first_dream")
+  keywords  String?
+  sentiment String?
+
+  @@index([userId])
+  @@index([createdAt])
+  @@index([sleptAt])
+}
