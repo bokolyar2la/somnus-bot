@@ -8,12 +8,12 @@ import {
 	updateUser,
 	updateUserProfile,
 } from '../../db/repo.js'
+import { detectTimezoneByIP } from '../../util/timezone.js'
 import {
 	isProfileComplete,
 	isValidTimeZone,
 	sendProfileReadyCta,
 } from '../helpers/profile.js'
-import { detectTimezoneByIP, POPULAR_TIMEZONES } from '../../util/timezone.js'
 
 /* ------------------------- helpers: локализация ------------------------- */
 function ruChronotype(v?: string) {
@@ -60,7 +60,7 @@ function profileCard(u: any) {
 function profileKb() {
 	return new InlineKeyboard()
 		.text('👶 Возраст', 'profile:age:menu')
-		.text('🕊 Хронотип', 'profile:chronotype:menu')
+		.text('🌑🌞 Хронотип', 'profile:chronotype:menu')
 		.row()
 		.text('⏰ Изменить таймзону', 'profile:timezone:menu')
 		.row()
@@ -294,15 +294,13 @@ export function registerProfileFlow(bot: Bot<MyContext>) {
 	bot.callbackQuery('profile:timezone:auto', async ctx => {
 		await ctx.answerCallbackQuery('🔍 Определяю ваше время...')
 		const userId = String(ctx.from!.id)
-		
+
 		try {
 			const tz = await detectTimezoneByIP()
-			
+
 			if (tz) {
 				await updateUser(userId, { timezone: tz })
-				await ctx.reply(
-					`✅ Время определено автоматически: ${tz}`
-				)
+				await ctx.reply(`✅ Время определено автоматически: ${tz}`)
 				const fresh = await getOrCreateUser(userId)
 				if (isProfileComplete(fresh)) {
 					await sendProfileReadyCta(ctx)
@@ -312,7 +310,7 @@ export function registerProfileFlow(bot: Bot<MyContext>) {
 					.text('🌍 Выбрать из списка', 'profile:timezone:popular')
 					.row()
 					.text('✍️ Ввести вручную', 'profile:timezone:manual')
-				
+
 				await ctx.reply(
 					'🤔 Не удалось определить время автоматически.\nВыберите другой способ:',
 					{ reply_markup: kb }
@@ -323,7 +321,7 @@ export function registerProfileFlow(bot: Bot<MyContext>) {
 				.text('🌍 Выбрать из списка', 'profile:timezone:popular')
 				.row()
 				.text('✍️ Ввести вручную', 'profile:timezone:manual')
-			
+
 			await ctx.reply(
 				'❌ Ошибка определения времени.\nВыберите другой способ:',
 				{ reply_markup: kb }
