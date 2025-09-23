@@ -1,8 +1,10 @@
 ﻿name: CI
+
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
+
 jobs:
   build-test:
     runs-on: ubuntu-latest
@@ -12,15 +14,22 @@ jobs:
         with:
           node-version: 20
           cache: npm
+
       - run: npm ci
+
+      # Prisma требует DATABASE_URL даже для generate
       - name: Prisma generate
         run: npx prisma generate
         env:
-          DATABASE_URL: "file:./ci.db"
+          DATABASE_URL: 'file:./ci.db'
+
       - run: npm run build
+
       - name: Smoke test
         run: npm run test:smoke
         env:
-          BOT_TOKEN: "0000000000:FAKE"
-          OPENAI_API_KEY: "sk-FAKE"
-          DATABASE_URL: "file:./ci.db"
+          BOT_TOKEN: '0000000000:FAKE'
+          OPENAI_API_KEY: 'sk-FAKE'
+          ADMIN_IDS: '726959884' # ← обязателен для config.ts
+          DATABASE_URL: 'file:./ci.db'
+          METRICS_ENABLED: 'false'
