@@ -1,25 +1,25 @@
+// src/core/llm.ts
 import {
 	InterpretationSchema,
 	type Interpretation,
 } from '../types/interpretation.js'
-import { OPENAI_API_KEY } from '../util/config.js'
 import { SYSTEM_PROMPT_RU } from './prompts.js'
 
-function clampStr(s: unknown, max = 700): string | null {
-	if (typeof s !== 'string') return null
-	return s.length > max ? s.slice(0, max) : s
-}
+// ---- Provider selection & env ----
+const LLM_PROVIDER = (process.env.LLM_PROVIDER || 'openai').toLowerCase()
 
-function sanitizeLlmJson(obj: any) {
-	if (!obj || typeof obj !== 'object') return obj
-	obj.esoteric_interpretation = clampStr(obj.esoteric_interpretation, 700) ?? ''
-	obj.barnum_insight = clampStr(obj.barnum_insight, 700) ?? obj.barnum_insight
-	obj.reflective_question = clampStr(obj.reflective_question, 300) ?? obj.reflective_question
-	// при необходимости — по другим строковым полям
-	return obj
-}
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || ''
+const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini'
 
-const MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini'
+const YANDEX_API_KEY =
+	process.env.YANDEX_API_KEY || process.env.YC_API_KEY || ''
+const YANDEX_FOLDER_ID =
+	process.env.YANDEX_FOLDER_ID || process.env.YC_FOLDER_ID || ''
+const YANDEX_MODEL =
+	process.env.YANDEX_MODEL ||
+	(YANDEX_FOLDER_ID ? `gpt://${YANDEX_FOLDER_ID}/yandexgpt-lite/latest` : '')
+
+// ---- Small utils ----
 const delay = (ms: number) => new Promise(res => setTimeout(res, ms))
 
 async function fetchWithTimeout(
@@ -40,79 +40,205 @@ async function fetchWithTimeout(
 	}
 }
 
-// JSON Schema под инструмент (function-calling в Chat Completions)
-const toolSchema = {
-	type: 'object',
-	additionalProperties: false,
-	required: [
-		'short_title',
-		'symbols_detected',
-		'barnum_insight',
-		'esoteric_interpretation',
-		'reflective_question',
-		'gentle_advice',
-	],
-	properties: {
-		short_title: { type: 'string', maxLength: 60 },
-		symbols_detected: {
-			type: 'array',
-			items: { type: 'string' },
-			maxItems: 12,
-			default: [],
-		},
-		barnum_insight: { type: 'string', maxLength: 300 },
-		esoteric_interpretation: { type: 'string', maxLength: 700 },
-		reflective_question: { type: 'string', maxLength: 200 },
-		gentle_advice: {
-			type: 'array',
-			items: { type: 'string' },
-			maxItems: 5,
-			default: [],
-		},
-		risk_flags: {
-			type: 'array',
-			items: { type: 'string' },
-		},
-		paywall_teaser: { type: 'string', maxLength: 140 },
-	},
+function clampStr(s: unknown, max = 700): string | null {
+	if (typeof s !== 'string') return null
+	return s.length > max ? s.slice(0, max) : s
 }
 
-function buildSystemPrompt(payload: any) {
-	// const allowed = ['neutral', 'poetic', 'mystic', 'calm-science'] as const
-	// const pTone = payload?.profile?.tone
-	// const desiredTone = (allowed as readonly string[]).includes(pTone)
-	// 	? pTone
-	// 	: 'neutral'
+function sanitizeLlmJson(obj: any) {
+	if (!obj || typeof obj !== 'object') return obj
+	obj.esoteric_interpretation = clampStr(obj.esoteric_interpretation, 700) ?? ''
+	obj.barnum_insight = clampStr(obj.barnum_insight, 700) ?? obj.barnum_insight
+	obj.reflective_question =
+		clampStr(obj.reflective_question, 300) ?? obj.reflective_question
+	return obj
+}
 
+// ---- Yandex chat wrapper ----
+type YaMsg = { role: 'system' | 'user' | 'assistant'; text: string }
+async function yandexChat(
+	messages: YaMsg[],
+	opts?: { temperature?: number; maxTokens?: number }
+): Promise<string> {
+	if (!YANDEX_API_KEY) throw new Error('YANDEX_API_KEY is not set')
+	const modelUri =
+		YANDEX_MODEL ||
+		(YANDEX_FOLDER_ID ? `gpt://${YANDEX_FOLDER_ID}/yandexgpt-lite/latest` : '')
+	if (!modelUri.startsWith('gpt://')) {
+		throw new Error('YANDEX_MODEL (modelUri) is not set correctly')
+	}
+
+	const body = {
+		modelUri,
+		completionOptions: {
+			stream: false,
+			temperature:
+				typeof opts?.temperature === 'number' ? opts.temperature : 0.3,
+			maxTokens: typeof opts?.maxTokens === 'number' ? opts.maxTokens : 1024,
+		},
+		messages,
+	}
+
+	const res = await fetchWithTimeout(
+		'https://llm.api.cloud.yandex.net/foundationModels/v1/completion',
+		{
+			method: 'POST',
+			headers: {
+				Authorization: `Api-Key ${YANDEX_API_KEY}`,
+				'Content-Type': 'application/json',
+			},
+			body: JSON.stringify(body),
+			timeoutMs: 30000,
+		}
+	)
+
+	const raw = await res.text()
+	if (!res.ok) {
+		let hint = ''
+		try {
+			hint = JSON.parse(raw)?.error?.message || ''
+		} catch {}
+		throw new Error(
+			`Yandex LLM HTTP ${res.status}: ${hint || raw.slice(0, 400)}`
+		)
+	}
+	let json: any
+	try {
+		json = JSON.parse(raw)
+	} catch {
+		throw new Error('Yandex returned non-JSON')
+	}
+
+	const txt = json?.result?.alternatives?.[0]?.message?.text
+	if (!txt) throw new Error('Yandex LLM: empty response')
+	return txt
+}
+
+// ---- OpenAI chat wrapper (fallback/compat) ----
+type OAIMsg = { role: 'system' | 'user' | 'assistant'; content: string }
+async function openaiChat(
+	messages: OAIMsg[],
+	opts?: { temperature?: number; maxTokens?: number }
+): Promise<string> {
+	if (!OPENAI_API_KEY)
+		throw new Error('OPENAI_API_KEY is empty (LLM_PROVIDER=openai)')
+	const body = {
+		model: OPENAI_MODEL,
+		messages,
+		temperature: typeof opts?.temperature === 'number' ? opts.temperature : 0.3,
+		max_tokens: typeof opts?.maxTokens === 'number' ? opts.maxTokens : 1024,
+	}
+
+	const res = await fetchWithTimeout(
+		'https://api.openai.com/v1/chat/completions',
+		{
+			method: 'POST',
+			headers: {
+				Authorization: `Bearer ${OPENAI_API_KEY}`,
+				'Content-Type': 'application/json',
+			},
+			body: JSON.stringify(body),
+			timeoutMs: 30000,
+		}
+	)
+
+	const raw = await res.text()
+	if (!res.ok) {
+		let hint = ''
+		try {
+			hint = JSON.parse(raw)?.error?.message || ''
+		} catch {}
+		throw new Error(`OpenAI HTTP ${res.status}: ${hint || raw.slice(0, 400)}`)
+	}
+
+	let json: any
+	try {
+		json = JSON.parse(raw)
+	} catch {}
+	const content = json?.choices?.[0]?.message?.content
+	if (!content) throw new Error('OpenAI: empty response')
+	return content
+}
+
+// ---- Provider router ----
+async function chatText(
+	sys: string,
+	user: string,
+	opts?: { temperature?: number; maxTokens?: number }
+): Promise<string> {
+	if (LLM_PROVIDER === 'yandex') {
+		const msgs: YaMsg[] = [
+			{ role: 'system', text: sys },
+			{ role: 'user', text: user },
+		]
+		return yandexChat(msgs, {
+			temperature: opts?.temperature,
+			maxTokens: opts?.maxTokens,
+		})
+	} else {
+		const msgs: OAIMsg[] = [
+			{ role: 'system', content: sys },
+			{ role: 'user', content: user },
+		]
+		return openaiChat(msgs, {
+			temperature: opts?.temperature,
+			maxTokens: opts?.maxTokens,
+		})
+	}
+}
+
+// Вспомогалка: аккуратно достать JSON из текста (если модель вдруг добавит что-то лишнее)
+function extractJsonObject(text: string): any {
+	try {
+		return JSON.parse(text)
+	} catch {}
+	const start = text.indexOf('{')
+	const end = text.lastIndexOf('}')
+	if (start >= 0 && end > start) {
+		const maybe = text.slice(start, end + 1)
+		try {
+			return JSON.parse(maybe)
+		} catch {}
+	}
+	throw new Error('Model did not return valid JSON')
+}
+
+// ---- Промпты ----
+function buildSystemPrompt(payload: any) {
 	return (
 		SYSTEM_PROMPT_RU +
 		`
 
-ЖЁСТКИЕ ТРЕБОВАНИЯ К ВЫХОДУ:
-- Верни ТОЛЬКО вызов инструмента return_interpretation с корректными аргументами.
-- Поле "tone" выставь в "poetic".
-- Если нет советов — gentle_advice: [].
-- Укладывайся в maxLength/maxItems.`
+ЖЁСТКИЕ ТРЕБОВАНИЯ К ВЫХОДУ (ОЧЕНЬ ВАЖНО):
+- Верни ТОЛЬКО JSON-объект строго по схеме:
+{
+  "short_title": string (<=60),
+  "symbols_detected": string[] (<=12),
+  "barnum_insight": string (<=300),
+  "esoteric_interpretation": string (<=700),
+  "reflective_question": string (<=200),
+  "gentle_advice": string[] (<=5),
+  "risk_flags": string[] (опционально),
+  "paywall_teaser": string (<=140, опционально)
+}
+- Никакого текста ДО или ПОСЛЕ JSON.
+- Укладывайся в maxLength/maxItems. Тон: "poetic".`
 	)
 }
 
 function buildFollowupSystemPrompt(payload: any) {
-	// const allowed = ['neutral', 'poetic', 'mystic', 'calm-science'] as const;
-	// const pTone = payload?.tone;
-	// const desiredTone = (allowed as readonly string[]).includes(pTone)
-	//   ? pTone
-	//   : 'neutral';
-
 	return (
 		SYSTEM_PROMPT_RU +
 		`
 
 ЖЁСТКИЕ ТРЕБОВАНИЯ К ВЫХОДУ:
-- Ответь кратко (2-5 предложений).
-- Используй настроение: "poetic".
-- Верни ТОЛЬКО текст ответа, без JSON и вызова инструментов.`
+- Ответь кратко (2–5 предложений), по-русски.
+- Тон: "poetic".
+- Верни ТОЛЬКО чистый текст ответа (без JSON).`
 	)
 }
+
+// ================== Экспорт API ==================
 
 export async function interpretDream(payload: {
 	profile: any
@@ -121,133 +247,30 @@ export async function interpretDream(payload: {
 	history_summary?: string
 	week_context?: string
 }): Promise<Interpretation> {
-	if (!OPENAI_API_KEY) throw new Error('OPENAI_API_KEY is empty')
+	const system = buildSystemPrompt(payload)
+	const user = JSON.stringify(payload)
 
-	const url = 'https://api.openai.com/v1/chat/completions'
 	const maxAttempts = 3
 	let lastErr: any = null
 
-	// Инструмент под схему
-	const tools = [
-		{
-			type: 'function',
-			function: {
-				name: 'return_interpretation',
-				description:
-					'Верни структурированную интерпретацию сна по заданной схеме. Не добавляй пояснения вне аргументов.',
-				parameters: toolSchema,
-			},
-		},
-	]
-
-	// Сообщения
-	const system = buildSystemPrompt(payload)
-	const messages = [
-		{ role: 'system', content: system },
-		{ role: 'user', content: JSON.stringify(payload) },
-	]
-
 	for (let attempt = 1; attempt <= maxAttempts; attempt++) {
 		try {
-			const body: any = {
-				model: MODEL,
-				messages,
-				tools,
-				tool_choice: {
-					type: 'function',
-					function: { name: 'return_interpretation' },
-				},
-				temperature: 0.4,
-				// НЕЛЬЗЯ "сломать" JSON вокруг, т.к. ответ приходит в tool_calls.arguments
-				max_tokens: 900,
-			}
-
-			const res = await fetchWithTimeout(url, {
-				method: 'POST',
-				headers: {
-					Authorization: `Bearer ${OPENAI_API_KEY}`,
-					'Content-Type': 'application/json',
-				},
-				body: JSON.stringify(body),
-				timeoutMs: 30000,
+			const txt = await chatText(system, user, {
+				temperature: 0.35,
+				maxTokens: 900,
 			})
-
-			const raw = await res.text()
-
-			if (!res.ok) {
-				let apiErr: any = null
-				try {
-					apiErr = JSON.parse(raw)
-				} catch {}
-				const hint =
-					apiErr?.error?.message || (raw ? String(raw).slice(0, 400) : '')
-				const httpMsg = `OpenAI HTTP ${res.status}: ${hint}`
-				if (
-					[429, 500, 502, 503, 504].includes(res.status) &&
-					attempt < maxAttempts
-				) {
-					await delay(400 * attempt)
-					continue
-				}
-				throw new Error(httpMsg)
-			}
-
-			// OK → парсим Chat Completions
-			let json: any
-			try {
-				json = JSON.parse(raw)
-			} catch {
-				throw new Error('OpenAI returned non-JSON body from /chat/completions')
-			}
-
-			const choice = json?.choices?.[0]
-			const toolCall = choice?.message?.tool_calls?.[0]
-			const argsStr = toolCall?.function?.arguments
-
-			if (!argsStr) {
-				// редкий случай — модель не сделала tool_call (хотя мы требовали)
-				// попробуем fallback: возможно, вернули текстом
-				const content = choice?.message?.content ?? ''
-				try {
-					const fallbackParsed = JSON.parse(content)
-					const safe2 = InterpretationSchema.safeParse(fallbackParsed)
-					if (!safe2.success) {
-						throw new Error(
-							'LLM JSON does not match schema (fallback): ' +
-								safe2.error.message
-						)
-					}
-					return safe2.data
-				} catch {
-					throw new Error(
-						'Model did not return tool_call arguments nor valid JSON content'
-					)
-				}
-			}
-
-			let parsed: any
-			try {
-				parsed = JSON.parse(argsStr)
-			} catch {
-				throw new Error('Tool call arguments are not valid JSON')
-			}
-
+			const parsed = extractJsonObject(txt)
 			const sanitized = sanitizeLlmJson(parsed)
 			const safe = InterpretationSchema.safeParse(sanitized)
 			if (!safe.success) {
-				// при отладке можно включить подробности:
-				// console.error("Schema mismatch:", safe.error.format());
-				throw new Error(
-					'LLM JSON does not match schema (post-validate): ' +
-						safe.error.message
-				)
+				throw new Error('LLM JSON does not match schema: ' + safe.error.message)
 			}
-
 			return safe.data
 		} catch (e: any) {
 			lastErr = e
-			const msg = String(e?.message || e)
-			const retryable = /timeout|aborted|fetch failed|429|5\d\d/i.test(msg)
+			const retryable = /timeout|aborted|fetch failed|429|5\d\d/i.test(
+				String(e?.message || e)
+			)
 			if (retryable && attempt < maxAttempts) {
 				await delay(400 * attempt)
 				continue
@@ -255,9 +278,7 @@ export async function interpretDream(payload: {
 			break
 		}
 	}
-
-	if (lastErr) throw lastErr
-	throw new Error('interpretDream failed: unknown error')
+	throw lastErr || new Error('interpretDream failed')
 }
 
 export async function followupAnswer(payload: {
@@ -265,77 +286,24 @@ export async function followupAnswer(payload: {
 	dream_text: string
 	user_question: string
 }): Promise<string> {
-	if (!OPENAI_API_KEY) throw new Error('OPENAI_API_KEY is empty')
+	const system = buildFollowupSystemPrompt(payload)
+	const user = `Сон:\n${payload.dream_text}\n\nВопрос:\n${payload.user_question}`
 
-	const url = 'https://api.openai.com/v1/chat/completions'
 	const maxAttempts = 3
 	let lastErr: any = null
 
-	const system = buildFollowupSystemPrompt(payload)
-	const messages = [
-		{ role: 'system', content: system },
-		{
-			role: 'user',
-			content: `Сон: ${payload.dream_text}\nВопрос: ${payload.user_question}`,
-		},
-	]
-
 	for (let attempt = 1; attempt <= maxAttempts; attempt++) {
 		try {
-			const body: any = {
-				model: MODEL,
-				messages,
-				temperature: 0.5, // 0.4-0.6 range
-				max_tokens: 250, // ~ 2-5 sentences
-			}
-
-			const res = await fetchWithTimeout(url, {
-				method: 'POST',
-				headers: {
-					Authorization: `Bearer ${OPENAI_API_KEY}`,
-					'Content-Type': 'application/json',
-				},
-				body: JSON.stringify(body),
-				timeoutMs: 30000,
+			const txt = await chatText(system, user, {
+				temperature: 0.3,
+				maxTokens: 300,
 			})
-
-			const raw = await res.text()
-
-			if (!res.ok) {
-				let apiErr: any = null
-				try {
-					apiErr = JSON.parse(raw)
-				} catch {}
-				const hint =
-					apiErr?.error?.message || (raw ? String(raw).slice(0, 400) : '')
-				const httpMsg = `OpenAI HTTP ${res.status}: ${hint}`
-				if (
-					[429, 500, 502, 503, 504].includes(res.status) &&
-					attempt < maxAttempts
-				) {
-					await delay(400 * attempt)
-					continue
-				}
-				throw new Error(httpMsg)
-			}
-
-			let json: any
-			try {
-				json = JSON.parse(raw)
-			} catch {
-				// not necessarily an error, as we expect plain text
-			}
-
-			const content = json?.choices?.[0]?.message?.content
-			if (content) {
-				return content
-			} else {
-				throw new Error('OpenAI did not return content for followup')
-			}
+			return txt.trim()
 		} catch (e: any) {
 			lastErr = e
-			const msg = String(e?.message || e)
-			const retryable = /timeout|aborted|fetch failed|429|5\d\d/i.test(msg)
+			const retryable = /timeout|aborted|fetch failed|429|5\d\d/i.test(
+				String(e?.message || e)
+			)
 			if (retryable && attempt < maxAttempts) {
 				await delay(400 * attempt)
 				continue
@@ -343,86 +311,36 @@ export async function followupAnswer(payload: {
 			break
 		}
 	}
-
-	if (lastErr) throw lastErr
-	throw new Error('followupAnswer failed: unknown error')
+	throw lastErr || new Error('followupAnswer failed')
 }
 
 export async function generatePractice(payload: {
 	entry_text: string
 	interpretation: string
 }): Promise<string> {
-	if (!OPENAI_API_KEY) throw new Error('OPENAI_API_KEY is empty')
+	const system =
+		`Ты — AI-интерпретатор снов для телеграм-бота “AI-Сонник”. ` +
+		`Сгенерируй короткую духовную практику: название + 3–5 очень коротких шагов, ` +
+		`и 1 строка смысла/эффекта. Стиль — поэтично-мистический, бережный.`
+	const user =
+		`Текст сна:\n${payload.entry_text}\n\nРазбор сна:\n${payload.interpretation}\n\n` +
+		`Сделай практику как списком шагов и одной завершающей строкой.`
 
-	const url = 'https://api.openai.com/v1/chat/completions'
 	const maxAttempts = 3
 	let lastErr: any = null
 
-	const system = `Ты — AI-интерпретатор снов для телеграм-бота “AI-Сонник”. Твоя задача — сгенерировать короткую духовную практику (2–6 строк инструкции, 1 строка смысла/эффекта), базирующуюся на предоставленном контексте сна и его разбора. Используй поэтично-мистический стиль с лёгкой психологией.`
-	const messages = [
-		{ role: 'system', content: system },
-		{
-			role: 'user',
-			content: `Текст сна: ${payload.entry_text}\nРазбор сна: ${payload.interpretation}\n\nСгенерируй духовную практику.`,
-		},
-	]
-
 	for (let attempt = 1; attempt <= maxAttempts; attempt++) {
 		try {
-			const body: any = {
-				model: MODEL,
-				messages,
-				temperature: 0.7, // Higher temperature for more creative output
-				max_tokens: 200, // Limit practice length
-			}
-
-			const res = await fetchWithTimeout(url, {
-				method: 'POST',
-				headers: {
-					Authorization: `Bearer ${OPENAI_API_KEY}`,
-					'Content-Type': 'application/json',
-				},
-				body: JSON.stringify(body),
-				timeoutMs: 30000,
+			const txt = await chatText(system, user, {
+				temperature: 0.6,
+				maxTokens: 220,
 			})
-
-			const raw = await res.text()
-
-			if (!res.ok) {
-				let apiErr: any = null
-				try {
-					apiErr = JSON.parse(raw)
-				} catch {}
-				const hint =
-					apiErr?.error?.message || (raw ? String(raw).slice(0, 400) : '')
-				const httpMsg = `OpenAI HTTP ${res.status}: ${hint}`
-				if (
-					[429, 500, 502, 503, 504].includes(res.status) &&
-					attempt < maxAttempts
-				) {
-					await delay(400 * attempt)
-					continue
-				}
-				throw new Error(httpMsg)
-			}
-
-			let json: any
-			try {
-				json = JSON.parse(raw)
-			} catch {
-				// not necessarily an error, as we expect plain text
-			}
-
-			const content = json?.choices?.[0]?.message?.content
-			if (content) {
-				return content
-			} else {
-				throw new Error('OpenAI did not return content for practice generation')
-			}
+			return txt.trim()
 		} catch (e: any) {
 			lastErr = e
-			const msg = String(e?.message || e)
-			const retryable = /timeout|aborted|fetch failed|429|5\d\d/i.test(msg)
+			const retryable = /timeout|aborted|fetch failed|429|5\d\d/i.test(
+				String(e?.message || e)
+			)
 			if (retryable && attempt < maxAttempts) {
 				await delay(400 * attempt)
 				continue
@@ -430,9 +348,7 @@ export async function generatePractice(payload: {
 			break
 		}
 	}
-
-	if (lastErr) throw lastErr
-	throw new Error('generatePractice failed: unknown error')
+	throw lastErr || new Error('generatePractice failed')
 }
 
 export async function generateReportSummary(input: {
@@ -448,107 +364,46 @@ export async function generateReportSummary(input: {
 		chronotype?: string | null
 	}
 }): Promise<string> {
-	if (!OPENAI_API_KEY) throw new Error('OPENAI_API_KEY is empty')
-
-	const url = 'https://api.openai.com/v1/chat/completions'
-	const maxAttempts = 3
-	let lastErr: any = null
-
-	// длина текста — короче для free, длиннее для paid
 	const isPaid = input.plan !== 'free'
-	const desiredLength = isPaid ? 7 : 4 // предложений
+	const desiredLength = isPaid ? 7 : 4
 
 	const topSymStr =
 		input.topSymbols.length > 0
 			? `Топ символов: ${input.topSymbols
-					.map(s => `${s.symbol} (${s.count} раз)`)
+					.map(s => `${s.symbol} (${s.count})`)
 					.join(', ')}.`
 			: ''
 
 	const userPrompt = [
-		`Сгенерируй мистический и тёплый обзор снов пользователя за ${input.periodDays} дней.`,
-		`Количество снов: ${input.countDreams}.`,
-		`Количество разборов ИИ: ${input.countInterps}.`,
-		`Максимальный стрик: ${input.streakMax} дней.`,
+		`Сгенерируй тёплый обзор снов за ${input.periodDays} дней.`,
+		`Снов: ${input.countDreams}. ИИ-разборов: ${input.countInterps}. Максимальный стрик: ${input.streakMax}.`,
 		topSymStr,
 		input.profile?.stressLevel != null
-			? `Уровень стресса (профиль): ${input.profile.stressLevel}.`
+			? `Уровень стресса: ${input.profile.stressLevel}.`
 			: '',
-		input.profile?.sleepGoal
-			? `Цель сна (профиль): ${input.profile.sleepGoal}.`
-			: '',
-		input.profile?.chronotype
-			? `Хронотип (профиль): ${input.profile.chronotype}.`
-			: '',
-		`Суммируй всё в ${desiredLength} предложениях.`,
-		`Стиль: поэтично-мистический с лёгкой психологией, дружеский, человечный.`,
-		`Обязательно используй уместные эмодзи.`,
-		`Заверши одной мягкой рекомендацией/практикой, продолжая доминирующий образ.`,
+		input.profile?.sleepGoal ? `Цель сна: ${input.profile.sleepGoal}.` : '',
+		input.profile?.chronotype ? `Хронотип: ${input.profile.chronotype}.` : '',
+		`Длина — ${desiredLength} предложений. Поэтично-мистический стиль, дружеский тон. Уместные эмодзи.`,
+		`Заверши одной мягкой рекомендацией/практикой.`,
 	]
 		.filter(Boolean)
 		.join('\n')
 
-	const messages = [
-		{ role: 'system', content: SYSTEM_PROMPT_RU },
-		{ role: 'user', content: userPrompt },
-	]
+	const maxAttempts = 3
+	let lastErr: any = null
 
 	for (let attempt = 1; attempt <= maxAttempts; attempt++) {
 		try {
-			const body: any = {
-				model: MODEL,
-				messages,
-				temperature: 0.7,
-				max_tokens: 300,
-			}
-
-			const res = await fetchWithTimeout(url, {
-				method: 'POST',
-				headers: {
-					Authorization: `Bearer ${OPENAI_API_KEY}`,
-					'Content-Type': 'application/json',
-				},
-				body: JSON.stringify(body),
-				timeoutMs: 30000,
+			const txt = await chatText(SYSTEM_PROMPT_RU, userPrompt, {
+				temperature: 0.6,
+				maxTokens: 320,
 			})
-
-			const raw = await res.text()
-
-			if (!res.ok) {
-				let apiErr: any = null
-				try {
-					apiErr = JSON.parse(raw)
-				} catch {}
-				const hint =
-					apiErr?.error?.message || (raw ? String(raw).slice(0, 400) : '')
-				const httpMsg = `OpenAI HTTP ${res.status}: ${hint}`
-				if (
-					[429, 500, 502, 503, 504].includes(res.status) &&
-					attempt < maxAttempts
-				) {
-					await delay(400 * attempt)
-					continue
-				}
-				throw new Error(httpMsg)
-			}
-
-			let json: any
-			try {
-				json = JSON.parse(raw)
-			} catch {
-				// норм: ждём обычный текст, но API возвращает JSON-обёртку
-			}
-
-			const content = json?.choices?.[0]?.message?.content
-			if (content) {
-				return content
-			} else {
-				throw new Error('OpenAI did not return content for report summary')
-			}
+			return txt.trim()
 		} catch (e: any) {
 			lastErr = e
-			const msg = String(e?.message || e)
-			const retryable = /timeout|aborted|fetch failed|429|5\d\d/i.test(msg)
+			const retryable = /timeout|aborted|fetch failed|429|5\d\d/i.test(
+				String(e?.message || e)
+			)
 			if (retryable && attempt < maxAttempts) {
 				await delay(400 * attempt)
 				continue
@@ -557,14 +412,12 @@ export async function generateReportSummary(input: {
 		}
 	}
 
-	if (lastErr) throw lastErr
-
-	// Фолбэк (если LLM недоступен): короткая «нить периода»
+	// fallback, если LLM недоступен
 	if (input.topSymbols.length >= 2) {
-		return `Период под знаком ${input.topSymbols[0].symbol} и ${input.topSymbols[1].symbol} — про движение ваших внутренних сюжетов и мягкое переосмысление ✨`
+		return `Период под знаком ${input.topSymbols[0].symbol} и ${input.topSymbols[1].symbol} — про движение внутренних сюжетов и мягкое переосмысление ✨`
 	} else if (input.topSymbols.length === 1) {
-		return `Период под знаком ${input.topSymbols[0].symbol} — про то, что этот образ сейчас важен и просит внимания ✨`
+		return `Период под знаком ${input.topSymbols[0].symbol} — этот образ сейчас важен и просит внимания ✨`
 	} else {
-		return `Период спокойный, без ярко повторяющихся образов 🙂`
+		return `Период спокойный, без повторяющихся образов 🙂`
 	}
 }
