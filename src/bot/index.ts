@@ -16,13 +16,10 @@ import { initSession, MyContext } from './helpers/state.js'
 import { mainKb, registerCommands } from './keyboards.js'
 
 import { InlineKeyboard } from 'grammy'
+import { startHttpServer } from '../http/server.js'
 import {
-	registerReportFlow,
-	handleReportCommand,
-} from './flows/reportFlow.js'
-import {
-	registerAnalyticsFlow,
 	handleAnalyticsCommand,
+	registerAnalyticsFlow,
 } from './flows/analyticsFlow.js'
 import { registerExportFlow } from './flows/exportFlow.js'
 import { answerFollowup } from './flows/followupFlow.js'
@@ -39,6 +36,7 @@ import {
 	handleRemindersMessage,
 	registerRemindersFlow,
 } from './flows/remindersFlow.js'
+import { handleReportCommand, registerReportFlow } from './flows/reportFlow.js'
 import {
 	handleSleepMessage,
 	openSleepInput,
@@ -163,7 +161,9 @@ bot.hears('📤 Экспорт', (ctx: MyContext) =>
 	ctx.reply('Выберите формат экспорта:', { reply_markup: exportMenuKb })
 )
 
-bot.command('menu', (ctx: MyContext) => ctx.reply('Главное меню:', { reply_markup: mainKb }))
+bot.command('menu', (ctx: MyContext) =>
+	ctx.reply('Главное меню:', { reply_markup: mainKb })
+)
 
 bot.callbackQuery('sleep:start', async (ctx: MyContext) => {
 	await ctx.answerCallbackQuery()
@@ -320,6 +320,7 @@ async function bootstrap() {
 		onStart: ({ username }: { username?: string }) =>
 			logger.info(`${username} started with long polling`),
 	})
+	startHttpServer()
 	startScheduler(bot)
 }
 
